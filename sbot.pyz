@@ -1,0 +1,110 @@
+import sqlite3
+from telegram import Update
+from telegram.ext import Updater, CommandHandler, CallbackContext
+import logging
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from the .env file
+load_dotenv()
+
+# Retrieve environment variables
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+ADMIN_ID = int(os.getenv('ADMIN_USER_ID'))
+# Setup logging
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Database setup
+conn = sqlite3.connect('wallets.db', check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS wallets (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    balance INTEGER DEFAULT 0,
+    fpl_tag TEXT,
+    is_active BOOLEAN DEFAULT 1
+)
+''')
+conn.commit()
+
+# Command to start the bot and create a wallet
+def start(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    username = update.effective_user.username
+
+    cursor.execute('SELECT * FROM wallets WHERE user_id = ?', (user_id,))
+    if cursor.fetchone():
+        update.message.reply_text("You already have a wallet!")
+    else:
+        cursor.execute('INSERT INTO wallets (user_id, username) VALUES (?, ?)', (user_id, username))
+        conn.commit()
+        update.message.reply_text(f"Wallet created successfully, {username}!")
+
+# Command for the admin to send coins
+def send_coins(update: Update, context: CallbackContext):
+    admin_id = ADMIN_ID
+    if update.effective_user.id != admin_id:
+        update.message.reply_text("You are not authorized to send coins.")
+        return
+
+    try:
+        username = context.args[0]
+        amount = int(context.args[1])
+
+        cursor.execute('SELECT * FROM wallets WHERE username = ?', (username,))
+        user = cursor.fetchone()
+
+        if user:
+            new_balance = user[2] + amount
+            cursor.execute('UPDATE wallets SET balance = ? WHERE username = ?', (new_balance, username))
+            conn.commit()
+            update.message.reply_text(f"Sent {amount} coins to {username}. New balance: {new_balance}")
+        else:
+            update.message.reply_text("User not found.")
+    except (IndexError, ValueError):
+        update.message.reply_text("Usage: /send_coins <username> <amount>")
+
+# Command to check balance
+def balance(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    cursor.execute('SELECT balance FROM wallets WHERE user_id = ?', (user_id,))
+    user = cursor.fetchone()
+
+    if user:
+        update.message.reply_text(f"Your balance is: {user[0]} coins.")
+    else:
+        update.message.reply_text("You do not have a wallet. Use /start to create one.")
+
+# Function to send coins automatically every week
+def distribute_weekly_coins(context: CallbackContext):
+    cursor.execute('SELECT username, balance FROM wallets')
+    users = cursor.fetchall()
+    weekly_amount = 10  # Define the amount to be sent weekly
+
+    for user in users:
+        new_balance = user[1] + weekly_amount
+        cursor.execute('UPDATE wallets SET balance = ? WHERE username = ?', (new_balance, user[0]))
+        conn.commit()
+
+    logger.info("Weekly coins distributed.")
+
+def main():
+    token = TOKEN
+    updater = Updater(token, use_context=True)
+    dispatcher = updater.dispatcher
+
+    dispatcher.add_handler(CommandHandler("start", start))
+    dispatcher.add_handler(CommandHandler("send_coins", send_coins))
+    dispatcher.add_handler(CommandHandler("balance", balance))
+
+    # Schedule the weekly coin distribution
+    job_queue = updater.job_queue
+    job_queue.run_repeating(distribute_weekly_coins, interval=7*24*60*60, first=0)  # Every week
+
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == '__main__':
+    main()
